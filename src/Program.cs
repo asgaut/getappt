@@ -9,7 +9,7 @@ using CommandLine;
 
 // Background information:
 // https://docs.microsoft.com/en-us/exchange/client-developer/exchange-web-services/get-started-with-ews-client-applications
-// https://docs.microsoft.com/en-us/exchange/client-developer/exchange-web-services/how-to-get-appointments-and-meetings-by-using-ews-in-exchange
+// https://stackoverflow.com/questions/43759529/get-appointments-from-coworker-via-ews-only-with-free-busy-time-subject-loc/43759990#43759990
 
 // This requires nuget packages:
 // Install-Package Exchange.WebServices.Managed.Api -Version 2.2.1.2
@@ -20,19 +20,11 @@ namespace GetAppt
 {
     class Program
     {
-        class Appt
+        class Data
         {
-            public string subject;
-            public DateTime start;
-            public DateTime end;
-            public string location;
-            public string freebusystatus;
-        }
-
-        class UserAppts
-        {
-            public string username;
-            public List<Appt> appointments;
+            public DateTime querytime;
+            public Dictionary<string, System.Collections.ObjectModel.Collection<CalendarEvent>> appointments;
+            public Dictionary<int, string> freebusystatusmap;
         }
 
         public class Options
@@ -63,47 +55,58 @@ namespace GetAppt
             }
             service.Url = new Uri(serverUrl);
 
-            // Initialize values for the start and end times, and the number of appointments to retrieve.
-            DateTime startDate = DateTime.Now;
-            DateTime endDate = startDate.AddDays(5);
-            const int NUM_APPTS = 5;
+            const int NUM_DAYS = 5;
 
-            // Set the start and end time and number of appointments to retrieve.
-            CalendarView cView = new CalendarView(startDate, endDate, NUM_APPTS)
-            {
-                // Limit the properties returned to the appointment's subject, start time, and end time.
-                PropertySet = new PropertySet(AppointmentSchema.Subject, AppointmentSchema.Start, AppointmentSchema.End,
-                AppointmentSchema.Location, AppointmentSchema.LegacyFreeBusyStatus)
-            };
-
-            List<UserAppts> appts = new List<UserAppts>();
+            // Create a collection of attendees. 
+            List<AttendeeInfo> attendees = new List<AttendeeInfo>();
             foreach (var u in users)
             {
-                var folderIdFromCalendar = new FolderId(WellKnownFolderName.Calendar, u);
-
-                // Initialize the calendar folder object with only the folder ID. 
-                CalendarFolder calendar = CalendarFolder.Bind(service, folderIdFromCalendar, new PropertySet());
-
-                // Retrieve a collection of appointments by using the calendar view.
-                FindItemsResults<Appointment> appointments = calendar.FindAppointments(cView);
-
-                var ua = new UserAppts { username = u, appointments = new List<Appt>() };
-                appts.Add(ua);
-                foreach (Appointment a in appointments)
+                attendees.Add(new AttendeeInfo()
                 {
-                    // Only access the initialized fields in 'a':
-                    var obj = new Appt
-                    {
-                        subject = a.Subject,
-                        start = a.Start,
-                        end = a.End,
-                        location = a.Location,
-                        freebusystatus = a.LegacyFreeBusyStatus.ToString()
-                    };
-                    ua.appointments.Add(obj);
-                }
+                    SmtpAddress = u,
+                    AttendeeType = MeetingAttendeeType.Required
+                });
             }
-            var json = Newtonsoft.Json.JsonConvert.SerializeObject(appts, Newtonsoft.Json.Formatting.Indented);
+
+            // Specify options to request free/busy information and suggested meeting times.
+            AvailabilityOptions availabilityOptions = new AvailabilityOptions
+            {
+                GoodSuggestionThreshold = 49,
+                MaximumNonWorkHoursSuggestionsPerDay = 0,
+                MaximumSuggestionsPerDay = 2,
+                // Note that 60 minutes is the default value for MeetingDuration, but setting it explicitly for demonstration purposes.
+                MeetingDuration = 60,
+                MinimumSuggestionQuality = SuggestionQuality.Good,
+                DetailedSuggestionsWindow = new TimeWindow(DateTime.Now.AddDays(0), DateTime.Now.AddDays(NUM_DAYS)),
+                RequestedFreeBusyView = FreeBusyViewType.Detailed
+            };
+
+            // Return free/busy information and a set of suggested meeting times. 
+            // This method results in a GetUserAvailabilityRequest call to EWS.
+            GetUserAvailabilityResults results = service.GetUserAvailability(attendees,
+                                                                             availabilityOptions.DetailedSuggestionsWindow,
+                                                                             AvailabilityData.FreeBusyAndSuggestions,
+                                                                             availabilityOptions);
+
+            Data data = new Data
+            {
+                querytime = DateTime.Now,
+                appointments = new Dictionary<string, System.Collections.ObjectModel.Collection<CalendarEvent>>(),
+                freebusystatusmap = new Dictionary<int, string>()
+                {
+                    { 0, "Free" }, //     The time slot associated with the appointment appears as free.
+                    { 1, "Tentative" }, //     The time slot associated with the appointment appears as tentative.
+                    { 2, "Busy" }, //     The time slot associated with the appointment appears as busy.
+                    { 3, "OOF" }, //     The time slot associated with the appointment appears as Out of Office.
+                    { 4, "WorkingElsewhere" }, //     The time slot associated with the appointment appears as working else where.
+                    { 5, "NoData" } //     No free/busy status is associated with the appointment.
+                }
+            };
+            for (int i = 0; i < results.AttendeesAvailability.Count; i++)
+            {
+                data.appointments[users[i]] = results.AttendeesAvailability[i].CalendarEvents;
+            }
+            var json = Newtonsoft.Json.JsonConvert.SerializeObject(data, Newtonsoft.Json.Formatting.Indented);
             if (cmdline.Verbose)
             {
                 Console.WriteLine(json);
@@ -132,7 +135,8 @@ namespace GetAppt
                 {
                     var res = req.GetResponse();
                     var buf = new byte[res.ContentLength];
-                    using (var rxStream = res.GetResponseStream()) {
+                    using (var rxStream = res.GetResponseStream())
+                    {
                         rxStream.Read(buf, 0, buf.Length);
                         var r = res as System.Net.HttpWebResponse;
                         Console.WriteLine("Response code: {0}, data:\r\n{1}", r.StatusCode, Encoding.UTF8.GetString(buf));
